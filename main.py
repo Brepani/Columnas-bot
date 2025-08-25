@@ -21,7 +21,7 @@ SOURCE_CHAT_ID = os.getenv("SOURCE_CHAT_ID")
 TIMEZONE = "America/Chihuahua"
 tz = pytz.timezone(TIMEZONE)
 
-# Validación temprana (para que el log diga qué falta)
+# Validación temprana
 missing = [k for k, v in {
     "TELEGRAM_TOKEN": TOKEN,
     "SUMMARY_CHAT_ID": SUMMARY_CHAT_ID,
@@ -70,26 +70,27 @@ def split_paragraphs(lines: List[str]) -> List[str]:
     return paras
 
 def clean_leading_icons(text: str) -> Tuple[str, List[str]]:
-    """Extrae íconos al inicio y dentro del párrafo, devuelve cuerpo limpio + lista de íconos encontrados."""
-    # Íconos al inicio (p.ej. '🟡⚠ Texto...')
+    """Quita íconos/bullets iniciales y recoge todos los íconos del párrafo."""
+    # Remueve bullets simples al inicio
+    t = text.lstrip(" -–—•*\t")
     start_icons = []
     i = 0
-    while i < len(text):
-        ch = text[i]
-        # considerar emojis compuestos (dos bytes visuales), usamos coincidencia simple por pertenencia
-        if text[i:i+2] in ICON_SET:
-            start_icons.append(text[i:i+2])
+    while i < len(t):
+        token2 = t[i:i+2]
+        if token2 in ICON_SET:
+            start_icons.append(token2)
             i += 2
             continue
-        if ch.isspace() or ch in "-–—•*":
+        if t[i].isspace() or t[i] in "-–—•*":
             i += 1
             continue
         break
-    body = text[i:].strip()
-    # También detecta íconos en el resto del texto (por si vienen después)
+    body = t[i:].strip()
     inner = [m.group(0) for m in re.finditer(r"(🟢|🟡|🔴|⚠️)", body)]
     icons = start_icons + inner
-    return body, list(dict.fromkeys(icons))  # únicos en orden
+    # Normaliza espacios raros
+    body = re.sub(r"\s+", " ", body).strip()
+    return body, list(dict.fromkeys(icons))
 
 def parse_header(header: str) -> Dict | None:
     """
@@ -97,10 +98,8 @@ def parse_header(header: str) -> Dict | None:
     - '🟡 BONILLA / JUÁREZ / EL DIARIO'
     - 'PAN / MORENA / ALCALDE BONILLA / ENTRELÍNEAS'
     Retorna dict con actors (list), alcance (str|''), medio (str)
-    y si viene color en el header, lo ignora (se toma del párrafo).
     """
     h = header.strip()
-    # Quitar color inicial si viene pegado al header
     if h[:2] in ICON_SET:
         h = h[2:].strip()
     parts = [p.strip() for p in h.split("/") if p.strip()]
@@ -122,32 +121,26 @@ def parse_message(text: str) -> List[Dict]:
     """
     try:
         lines = [ln for ln in (text or "").split("\n")]
-        # Buscar link (última línea http)
+        # Link (último http*)
         link = ""
         for ln in reversed(lines):
             if ln.strip().startswith("http"):
                 link = ln.strip()
                 break
-        # Header = primera línea no vacía
+        # Header
         first_nonempty_idx = next((i for i, ln in enumerate(lines) if ln.strip()), None)
         if first_nonempty_idx is None:
             return []
         header = lines[first_nonempty_idx].strip()
         meta = parse_header(header)
         if not meta:
-            return []  # sin header válido, ignorar
+            return []
 
-        # Rango del cuerpo (entre después del header y antes del link si aplica)
+        # Cuerpo entre header y link
         end_idx = len(lines)
         if link:
-            # toma hasta la línea del link exclusiva
             end_idx = next((i for i, ln in enumerate(lines) if ln.strip() == link), len(lines))
         body_lines = lines[first_nonempty_idx + 1:end_idx]
-
-        # Ignorar una posible línea de "sección" (ENTRELÍNEAS, CAJA NEGRA) si está sola
-        if body_lines and body_lines[0].strip() and body_lines[0].strip().upper() == body_lines[0].strip() and len(body_lines) >= 1:
-            # Mantenerla en el cuerpo; no la quitamos para no perder contexto
-            pass
 
         paragraphs = split_paragraphs(body_lines)
         items: List[Dict] = []
@@ -165,7 +158,6 @@ def parse_message(text: str) -> List[Dict]:
                 "link": link,
                 "ts": ahora_tz(),
             })
-        # Si no se detectó ningún párrafo (todo vacío), crear una entrada neutra con el header
         if not items:
             items.append({
                 "color": "🟡",
@@ -184,6 +176,25 @@ def parse_message(text: str) -> List[Dict]:
 def filtrar_por_rango(cols: List[Dict], start: datetime, end: datetime) -> List[Dict]:
     return [c for c in cols if start <= c["ts"] < end]
 
+def extract_topic(texto: str) -> str:
+    """
+    Toma la primera línea/frase del párrafo como 'tema'.
+    Limpia bullets y recorta a 60-80 chars para que sea legible.
+    """
+    if not texto:
+        return ""
+    # primera línea
+    first_line = texto.split("\n", 1)[0].strip()
+    first_line = first_line.lstrip("-–—•* ").strip()
+    # si hay punto, toma la primera oración (pero no de 1-2 palabras)
+    sentence = re.split(r"[.!?]\s", first_line)[0].strip() or first_line
+    sentence = re.sub(r"\s+", " ", sentence)
+    if len(sentence) < 4:
+        return ""
+    if len(sentence) > 80:
+        sentence = sentence[:80].rstrip() + "…"
+    return sentence
+
 def generar_resumen(cols: List[Dict], titulo_hora: str) -> str:
     if not cols:
         return "🔵 COLUMNAS / Hoy no se recibieron columnas en el periodo solicitado."
@@ -191,41 +202,57 @@ def generar_resumen(cols: List[Dict], titulo_hora: str) -> str:
     total = len(cols)
     colores = {"🟢": 0, "🟡": 0, "🔴": 0, "⚠️": 0}
     actores: Dict[str, Dict[str, int]] = {}
+    medios_count: Dict[str, int] = {}
+    topics_count: Dict[str, int] = {}
 
     for it in cols:
+        # semáforo
         colores[it["color"]] = colores.get(it["color"], 0) + 1
+        # actores
         for a in it["actors"]:
             if a not in actores:
                 actores[a] = {"🟢": 0, "🟡": 0, "🔴": 0, "⚠️": 0, "total": 0}
             actores[a][it["color"]] += 1
             actores[a]["total"] += 1
+        # medios
+        medio = it["medio"].strip()
+        medios_count[medio] = medios_count.get(medio, 0) + 1
+        # temas
+        t = extract_topic(it.get("cuerpo", ""))
+        if t:
+            topics_count[t] = topics_count.get(t, 0) + 1
 
-    out = f"## 🔵 COLUMNAS / {titulo_hora}\n\n"
+    out = f"🔵 COLUMNAS / {titulo_hora}\n\n"
 
-    out += "### 🚦 Semáforo\n"
+    # Semáforo
+    out += "🚦 Semáforo\n"
     out += f"🟢 Positivas: {colores.get('🟢', 0)}\n"
     out += f"🟡 Neutras:   {colores.get('🟡', 0)}\n"
     out += f"🔴 Negativas: {colores.get('🔴', 0)}\n"
     out += f"⚠️ Alertas:   {colores.get('⚠️', 0)}\n"
-    out += f"**Total entradas: {total}**\n\n"
+    out += f"Total entradas: {total}\n\n"
 
-    out += "### 👥 Actores top\n```\n"
+    # Actores top (en bloque monoespaciado para que alinee)
+    out += "👥 Actores top\n"
+    out += "```\n"
     for actor, data in sorted(actores.items(), key=lambda x: x[1]["total"], reverse=True):
         out += (f"{actor:<22} "
                 f"🟢{data['🟢']} 🟡{data['🟡']} 🔴{data['🔴']} ⚠️{data['⚠️']} "
                 f"| Total {data['total']}\n")
     out += "```\n\n"
 
-    out += "### 🔗 Links\n"
-    seen = set()
-    for it in cols:
-        link = it.get("link", "")
-        if link and link not in seen:
-            seen.add(link)
-            medio_fmt = it['medio'].replace("*", "")
-            actors_str = ", ".join(it["actors"])
-            alcance = f" ({it['alcance']})" if it['alcance'] else ""
-            out += f"{it['color']} *{medio_fmt}*{alcance} – {actors_str}: [Abrir]({link})\n"
+    # Medios con publicación
+    out += "📰 Medios con publicación\n"
+    for medio, cnt in sorted(medios_count.items(), key=lambda x: x[1], reverse=True):
+        out += f"- {medio}\n"
+    out += "\n"
+
+    # Temas principales (top 5)
+    if topics_count:
+        out += "📌 Temas principales\n"
+        for tema, cnt in sorted(topics_count.items(), key=lambda x: x[1], reverse=True)[:5]:
+            out += f"- {tema}\n"
+
     return out
 
 def armar_alerta(it: Dict) -> str:
@@ -257,7 +284,7 @@ async def cmd_resumen_hoy(message: Message):
 
 @dp.message(Command("links"))
 async def cmd_links(message: Message):
-    """Lista solo los links de HOY (únicos)."""
+    """Lista solo los links de HOY (por si lo necesitas)."""
     now = ahora_tz()
     start = now.replace(hour=0, minute=0, second=0, microsecond=0)
     subset = filtrar_por_rango(all_items, start, now)
@@ -270,7 +297,7 @@ async def cmd_links(message: Message):
     if not links:
         await bot.send_message(SUMMARY_CHAT_ID, "🔗 Hoy no hay links registrados.")
         return
-    await bot.send_message(SUMMARY_CHAT_ID, "### 🔗 Links de hoy\n" + "\n".join(links), parse_mode="Markdown")
+    await bot.send_message(SUMMARY_CHAT_ID, "🔗 Links de hoy\n" + "\n".join(links))
 
 @dp.message()
 async def recibir_columnas(message: Message):
@@ -281,16 +308,15 @@ async def recibir_columnas(message: Message):
 
         texto = message.text or ""
         if "/" not in texto:
-            return  # sin encabezado con '/', ignorar
+            return  # requerimos encabezado con '/'
 
         items = parse_message(texto)
         if not items:
             return
 
-        # Guardar TODO (para /resumen_hoy)
         all_items.extend(items)
 
-        # Enviar alertas de inmediato por cada párrafo rojo/alerta
+        # Alertas inmediatas
         for it in items:
             if it["color"] in ("🔴", "⚠️") and ALERTS_CHAT_ID:
                 try:
