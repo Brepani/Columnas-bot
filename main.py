@@ -42,7 +42,7 @@ bot = Bot(token=TOKEN)
 dp = Dispatcher()
 
 # =========================
-# Memoria
+# Memoria (una entrada por COLUMNA / link)
 # =========================
 all_items: List[Dict] = []
 
@@ -77,14 +77,12 @@ def extraer_header_y_cuerpo(texto: str) -> Tuple[str, str]:
     return header, cuerpo
 
 # -------- Canonización de actores --------
-# Accentos fuera para el matching
 def _sin_acentos(s: str) -> str:
     return (s
             .replace("Á","A").replace("É","E").replace("Í","I")
             .replace("Ó","O").replace("Ú","U").replace("Ü","U")
             .replace("Ñ","N"))
 
-# Palabras de rol a eliminar al inicio
 ROLES = {
     "ALCALDE","ALCALDESA","PRESIDENTE MUNICIPAL","PRESIDENTA MUNICIPAL",
     "GOBERNADOR","GOBERNADORA","DIPUTADO","DIPUTADA","SENADOR","SENADORA",
@@ -100,7 +98,7 @@ def quitar_rol(s: str) -> str:
             break
     return t
 
-# Alias (ejemplos más comunes; puedes ampliarlo cuando quieras)
+# Alias de personas frecuentes (puedes ampliar cuando quieras)
 ALIASES = {
     "MARCO BONILLA":"MARCO BONILLA",
     "BONILLA":"MARCO BONILLA",
@@ -125,8 +123,6 @@ ALIASES = {
     "CESAR JAUREGUI":"CÉSAR JÁUREGUI MORENO",
     "JAUREGUI":"CÉSAR JÁUREGUI MORENO",
 }
-
-# Mapa sin acentos -> canon
 ALIASES_NORM = { _sin_acentos(k):v for k,v in ALIASES.items() }
 ACTORES_CANON_SET = set(ALIASES.values())
 
@@ -137,10 +133,9 @@ def canon_actor(s: str) -> str:
     key = _sin_acentos(t)
     if key in ALIASES_NORM:
         return ALIASES_NORM[key]
-    return t  # si no hay alias, deja el texto limpio
+    return t
 
 def partir_actores_chunk(chunk: str) -> List[str]:
-    # separa por coma, slash, ' y ', ' e ', guiones
     tmp = re.split(r"[,/]| y | e | - ", chunk, flags=re.IGNORECASE)
     return [a for a in map(limpiar, tmp) if a]
 
@@ -169,7 +164,6 @@ def parse_header(header: str) -> Tuple[List[str], str, str]:
             alcance = penult
             core = core[:-1]
 
-    # core puede tener varios actores en un mismo chunk: separa y canoniza
     actores: List[str] = []
     for ch in core:
         for a in partir_actores_chunk(ch):
@@ -193,7 +187,6 @@ def parse_message(texto: str) -> List[Dict]:
     link = urls[-1] if urls else ""
     if not link:
         return []
-
     color = detectar_color(texto)
     col_id = hash_columna(link)
     return [{
@@ -228,7 +221,7 @@ def armar_alerta(it: Dict) -> str:
     return out
 
 # =========================
-# Resumen
+# Resumen: semáforo, actores, medios
 # =========================
 def contar_semaforo(items: List[Dict]) -> Tuple[int, int, int, int]:
     v = sum(1 for x in items if x["color"] == "🟢")
@@ -263,19 +256,21 @@ def medios_con_publicacion(items: List[Dict]) -> List[str]:
             vistos.add(m); out.append(m)
     return out
 
-# -------- Temas (n-grams) con filtros --------
+# =========================
+# Temas principales (semánticos + fallback)
+# =========================
+# Stopwords y filtros
 STOP_ES = {
     "LA","EL","LOS","LAS","DE","DEL","AL","A","Y","O","U","EN","POR","PARA","CON",
     "SE","QUE","SU","SUS","UN","UNA","UNOS","UNAS","LO","LES","YA","NO","SI","SÍ",
     "MAS","MÁS","COMO","ES","SON","SER","FUE","HAN","HAY","ESTE","ESTA","ESTOS","ESTAS",
     "ESE","ESA","AQUEL","AQUELLA","ANTE","BAJO","CABE","HACIA","HASTA","TRAS","ENTRE",
     "SOBRE","MUY","TAMBIÉN","TAMBIEN","PERO","NI","SINO","LE","DEBE","DEBEN","DEBEMOS",
-    # basura típica de medios/links
     "HTTPS","HTTP","WWW","COM","MX","NOTICIAS","ENTRELÍNEAS","ENTRELINEAS",
     "OMNIA","PARADOJA","HERALDO","RED","VOZ","NOTA","COLUMNA","OPINIÓN","OPINION",
     "OTROS","INTERES","INTERÉS","SIN","MEDIO"
 }
-ROLES_BAN = { _sin_acentos(r) for r in ROLES }  # evita que salgan como temas
+ROLES_BAN = { _sin_acentos(r) for r in ROLES }
 
 def _tokenizar(texto: str) -> List[str]:
     t = re.sub(r"[^A-ZÁÉÍÓÚÜÑ0-9 ]", " ", (texto or "").upper())
@@ -292,43 +287,133 @@ def _ngrams(words: List[str], n: int) -> List[str]:
     if len(words) < n: return []
     return [" ".join(words[i:i+n]) for i in range(len(words)-n+1)]
 
+# --- Reglas semánticas editoriales ---
+def _up(s: str) -> str:
+    return _sin_acentos((s or "").upper())
+
+KW_LUGARES_CDMX = {"CDMX", "CIUDAD DE MEXICO", "CIUDAD DE MÉXICO", "MEXICO", "CD. MX", "CDMX,"}
+KW_ACCION_VIAJE = {"VIAJE", "GIRA", "REUNION", "REUNIÓN", "ENCUENTRO", "AGENDA", "VISITA"}
+KW_CONFLICTO = {"CONFLICTO", "RUPTURA", "DIVISION", "DIVISIÓN", "DISPUTA", "PUGNA", "GRILLA", "PLEITO", "TENSION", "TENSIÓN", "CRISIS"}
+KW_UNIDAD = {"UNIDAD", "CIERRE DE FILAS", "ACUERDO", "CONSENSO"}
+KW_PAN = {"PAN", "ACCION NACIONAL", "ACCIÓN NACIONAL", "ALBIAZUL"}
+KW_GABINETE = {"GABINETE", "SECRETARIO", "SECRETARIA", "TITULAR", "DEPENDENCIA"}
+KW_MOVIMIENTOS = {"CAMBIO", "CAMBIOS", "NOMBRAMIENTO", "NOMBRA", "RENUNCIA", "RENUNCIÓ", "RELEVO", "SUSTITUCION", "SUSTITUCIÓN", "DESIGNACION", "DESIGNACIÓN"}
+KW_ESTADO = {"GOBIERNO DEL ESTADO", "ESTADO", "ESTATAL", "PALACIO DE GOBIERNO", "MARU CAMPOS"}
+
+TOPIC_RULES = [
+    {
+        "id": "viaje_marco_cdmx",
+        "label": "Viaje de Marco a la CDMX",
+        "must_any": [{"MARCO BONILLA"}],
+        "any": [KW_LUGARES_CDMX, KW_ACCION_VIAJE],
+        "avoid": []
+    },
+    {
+        "id": "conflictos_internos_pan",
+        "label": "Conflictos internos en el PAN",
+        "must_any": [KW_PAN],
+        "any": [KW_CONFLICTO],
+        "avoid": []  # si quisieras excluir “unidad”, añade KW_UNIDAD aquí
+    },
+    {
+        "id": "cambios_gabinete_estado",
+        "label": "Cambios en el gabinete del Estado",
+        "must_any": [KW_GABINETE, KW_MOVIMIENTOS],
+        "any": [KW_ESTADO],
+        "avoid": []
+    },
+]
+
+def _texto_cumple_regla(txt_up: str, regla: dict) -> bool:
+    for conj in regla.get("must_any", []):
+        if not any(w in txt_up for w in conj):
+            return False
+    for grupo in regla.get("any", []):
+        if not any(w in txt_up for w in grupo):
+            return False
+    for grupo in regla.get("avoid", []):
+        if any(w in txt_up for w in grupo):
+            return False
+    return True
+
+def _oracion_snippet(txt: str, palabras: Set[str]) -> str:
+    oraciones = re.split(r"(?<=[.!?])\s+", txt.strip())
+    for o in oraciones:
+        o_up = _up(o)
+        if any(p in o_up for p in palabras):
+            o_clean = o.strip()
+            return (o_clean[:140] + "…") if len(o_clean) > 140 else o_clean
+    base = txt.strip()
+    return (base[:140] + "…") if len(base) > 140 else base
+
 def extraer_temas(items: List[Dict], max_temas: int = 5) -> List[str]:
-    from collections import Counter, defaultdict
+    """
+    1) Reglas semánticas (viajes, conflictos PAN, cambios gabinete) por COLUMNA.
+    2) Si no hay match, fallback n-grams filtrados (sin actores/roles/basura).
+    Devuelve: "Título (menciones: N) — medios: A, B"
+    """
+    from collections import defaultdict, Counter
+
+    # Agrupa por columna
+    cols = {}  # col_id -> {medio, txt, txt_up}
+    for it in items:
+        cid = it["col_id"]
+        medio = it.get("medio","SIN MEDIO")
+        cuerpo = (it.get("cuerpo") or "")
+        cab = " ".join(it.get("actors", [])) + " " + it.get("alcance","")
+        txt = limpiar(cab + " " + cuerpo)
+        cols[cid] = {"medio": medio, "txt": txt, "txt_up": _up(txt)}
+
+    # Intento semántico
+    tema_cols = defaultdict(set)
+    tema_medios = defaultdict(set)
+    for cid, data in cols.items():
+        txt_up = data["txt_up"]
+        medio = data["medio"]
+        for regla in TOPIC_RULES:
+            if _texto_cumple_regla(txt_up, regla):
+                label = regla["label"]
+                tema_cols[label].add(cid)
+                tema_medios[label].add(medio)
+
+    if tema_cols:
+        orden = sorted(tema_cols.items(), key=lambda kv: len(kv[1]), reverse=True)[:max_temas]
+        salida = []
+        for label, cids in orden:
+            menc = len(cids)
+            meds = ", ".join(sorted(list(tema_medios[label]))[:4])
+            salida.append(f"{label} (menciones: {menc}) — medios: {meds}")
+        return salida
+
+    # Fallback: n-grams sin actores
     cnt = Counter()
     tema_en_medio = defaultdict(set)
-
     actores_can_sin_acento = { _sin_acentos(a) for a in ACTORES_CANON_SET }
 
-    for it in items:
-        cuerpo = (it.get("cuerpo") or "").replace("\n", " ")
-        base = limpiar(cuerpo)
-        words = _tokenizar(base)
+    for cid, data in cols.items():
+        words = _tokenizar(data["txt"])
         grams = _ngrams(words, 3) + _ngrams(words, 2)
 
-        # filtra n-grams que contengan actores (para que temas no sean nombres)
         grams_filtrados = []
         for g in grams:
             g_sin = _sin_acentos(g)
-            if any(a in g_sin for a in actores_can_sin_acento):
+            if any(a in g_sin for a in actores_can_sin_acento):  # no nombres de personas
                 continue
-            if g_sin in STOP_ES:  # por si algún bigrama cae completo en stop
+            if g_sin in STOP_ES:
                 continue
             grams_filtrados.append(g)
 
-        for g in set(grams_filtrados):  # únicos por documento
+        for g in set(grams_filtrados):
             cnt[g] += 1
-            tema_en_medio[g].add(it.get("medio","SIN MEDIO"))
+            tema_en_medio[g].add(data["medio"])
 
-    if not cnt: return []
+    if not cnt:
+        return []
 
-    # prioriza por frecuencia y por longitud (más específico)
     top = sorted(cnt.items(), key=lambda kv: (kv[1], len(kv[0])), reverse=True)
-
-    elegidos: List[str] = []
-    bases: Set[str] = set()
+    elegidos, bases = [], set()
     for g, _ in top:
         base = _sin_acentos(g)
-        # evita duplicados cercanos
         if any(base.startswith(b) or b.startswith(base) for b in bases):
             continue
         bases.add(base)
@@ -339,8 +424,8 @@ def extraer_temas(items: List[Dict], max_temas: int = 5) -> List[str]:
     salida = []
     for g in elegidos:
         menc = cnt[g]
-        medios = ", ".join(sorted(list(tema_en_medio[g]))[:4])
-        salida.append(f"{g.title()} (menciones: {menc}) — medios: {medios}")
+        meds = ", ".join(sorted(list(tema_en_medio[g]))[:4])
+        salida.append(f"{g.title()} (menciones: {menc}) — medios: {meds}")
     return salida
 
 def generar_resumen(items: List[Dict], titulo: str) -> str:
@@ -432,6 +517,7 @@ async def recibir_columnas(message: Message):
 
         all_items.extend(nuevos)
 
+        # Alertas (🔴/⚠️)
         for it in nuevos:
             if it["color"] in ("🔴", "⚠️") and ALERTS_CHAT_ID:
                 try:
