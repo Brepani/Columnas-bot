@@ -16,15 +16,13 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 # Config por variables de entorno
 # =========================
 TOKEN = os.getenv("TELEGRAM_TOKEN")
-SUMMARY_CHAT_ID = os.getenv("SUMMARY_CHAT_ID")   # Chat donde sale el resumen
-ALERTS_CHAT_ID = os.getenv("ALERTS_CHAT_ID")     # Chat donde se mandan alertas 🔴/⚠️
-SOURCE_CHAT_ID = os.getenv("SOURCE_CHAT_ID")     # Chat del que se leen las columnas
+SUMMARY_CHAT_ID = os.getenv("SUMMARY_CHAT_ID")
+ALERTS_CHAT_ID = os.getenv("ALERTS_CHAT_ID")
+SOURCE_CHAT_ID = os.getenv("SOURCE_CHAT_ID")
 
 TIMEZONE = "America/Chihuahua"
 tz = pytz.timezone(TIMEZONE)
-
-def ahora_tz() -> datetime:
-    return datetime.now(tz)
+def ahora_tz() -> datetime: return datetime.now(tz)
 
 missing = [k for k, v in {
     "TELEGRAM_TOKEN": TOKEN,
@@ -98,7 +96,6 @@ def quitar_rol(s: str) -> str:
             break
     return t
 
-# Alias de personas frecuentes (puedes ampliar cuando quieras)
 ALIASES = {
     "MARCO BONILLA":"MARCO BONILLA",
     "BONILLA":"MARCO BONILLA",
@@ -153,11 +150,9 @@ def parse_header(header: str) -> Tuple[List[str], str, str]:
     tokens = [limpiar(p) for p in clean.split("/") if limpiar(p)]
     if len(tokens) < 2:
         return [], "", ""
-
     medio = normalizar_token(tokens[-1])
     alcance = ""
     core = tokens[1:-1]
-
     if core:
         penult = normalizar_token(core[-1])
         if penult in ALCANCE_CATALOG:
@@ -252,23 +247,29 @@ def medios_con_publicacion(items: List[Dict]) -> List[str]:
     out: List[str] = []
     for it in items:
         m = it["medio"]
-        if m and m not in vistos:
+        if not m: 
+            continue
+        if m == "SIN MEDIO" and vistos:  # oculta SIN MEDIO si ya hay reales
+            continue
+        if m not in vistos:
             vistos.add(m); out.append(m)
     return out
 
 # =========================
 # Temas principales (semánticos + fallback)
 # =========================
-# Stopwords y filtros
 STOP_ES = {
     "LA","EL","LOS","LAS","DE","DEL","AL","A","Y","O","U","EN","POR","PARA","CON",
     "SE","QUE","SU","SUS","UN","UNA","UNOS","UNAS","LO","LES","YA","NO","SI","SÍ",
     "MAS","MÁS","COMO","ES","SON","SER","FUE","HAN","HAY","ESTE","ESTA","ESTOS","ESTAS",
     "ESE","ESA","AQUEL","AQUELLA","ANTE","BAJO","CABE","HACIA","HASTA","TRAS","ENTRE",
     "SOBRE","MUY","TAMBIÉN","TAMBIEN","PERO","NI","SINO","LE","DEBE","DEBEN","DEBEMOS",
-    "HTTPS","HTTP","WWW","COM","MX","NOTICIAS","ENTRELÍNEAS","ENTRELINEAS",
-    "OMNIA","PARADOJA","HERALDO","RED","VOZ","NOTA","COLUMNA","OPINIÓN","OPINION",
-    "OTROS","INTERES","INTERÉS","SIN","MEDIO"
+    # basura web/domínios
+    "HTTPS","HTTP","WWW","COM","MX","PHP","HTML","HTM","AMP",
+    "ENTRELÍNEAS","ENTRELINEAS","OMNIA","PARADOJA","HERALDO","VOZ","RED","NOTICIAS",
+    "OEM","ELHERALDODECHIHUAHUA","ELHERALDO","ANALISIS","ANÁLISIS","RAFAGAS","RÁFAGAS",
+    "VIDEO","FOTO","GALERIA","GALERÍA","EDITORIAL","COLUMNA","OPINION","OPINIÓN",
+    "OTROS","INTERES","INTERÉS","SIN","MEDIO","CHIHUAHUENSES","CHIHUAHUA"
 }
 ROLES_BAN = { _sin_acentos(r) for r in ROLES }
 
@@ -287,7 +288,6 @@ def _ngrams(words: List[str], n: int) -> List[str]:
     if len(words) < n: return []
     return [" ".join(words[i:i+n]) for i in range(len(words)-n+1)]
 
-# --- Reglas semánticas editoriales ---
 def _up(s: str) -> str:
     return _sin_acentos((s or "").upper())
 
@@ -301,80 +301,43 @@ KW_MOVIMIENTOS = {"CAMBIO", "CAMBIOS", "NOMBRAMIENTO", "NOMBRA", "RENUNCIA", "RE
 KW_ESTADO = {"GOBIERNO DEL ESTADO", "ESTADO", "ESTATAL", "PALACIO DE GOBIERNO", "MARU CAMPOS"}
 
 TOPIC_RULES = [
-    {
-        "id": "viaje_marco_cdmx",
-        "label": "Viaje de Marco a la CDMX",
-        "must_any": [{"MARCO BONILLA"}],
-        "any": [KW_LUGARES_CDMX, KW_ACCION_VIAJE],
-        "avoid": []
-    },
-    {
-        "id": "conflictos_internos_pan",
-        "label": "Conflictos internos en el PAN",
-        "must_any": [KW_PAN],
-        "any": [KW_CONFLICTO],
-        "avoid": []  # si quisieras excluir “unidad”, añade KW_UNIDAD aquí
-    },
-    {
-        "id": "cambios_gabinete_estado",
-        "label": "Cambios en el gabinete del Estado",
-        "must_any": [KW_GABINETE, KW_MOVIMIENTOS],
-        "any": [KW_ESTADO],
-        "avoid": []
-    },
+    {"id":"viaje_marco_cdmx","label":"Viaje de Marco a la CDMX","must_any":[{"MARCO BONILLA"}],"any":[KW_LUGARES_CDMX,KW_ACCION_VIAJE],"avoid":[]},
+    {"id":"conflictos_internos_pan","label":"Conflictos internos en el PAN","must_any":[KW_PAN],"any":[KW_CONFLICTO],"avoid":[]},
+    {"id":"cambios_gabinete_estado","label":"Cambios en el gabinete del Estado","must_any":[KW_GABINETE,KW_MOVIMIENTOS],"any":[KW_ESTADO],"avoid":[]},
 ]
 
-def _texto_cumple_regla(txt_up: str, regla: dict) -> bool:
-    for conj in regla.get("must_any", []):
-        if not any(w in txt_up for w in conj):
-            return False
-    for grupo in regla.get("any", []):
-        if not any(w in txt_up for w in grupo):
-            return False
-    for grupo in regla.get("avoid", []):
-        if any(w in txt_up for w in grupo):
-            return False
-    return True
-
-def _oracion_snippet(txt: str, palabras: Set[str]) -> str:
-    oraciones = re.split(r"(?<=[.!?])\s+", txt.strip())
-    for o in oraciones:
-        o_up = _up(o)
-        if any(p in o_up for p in palabras):
-            o_clean = o.strip()
-            return (o_clean[:140] + "…") if len(o_clean) > 140 else o_clean
-    base = txt.strip()
-    return (base[:140] + "…") if len(base) > 140 else base
-
 def extraer_temas(items: List[Dict], max_temas: int = 5) -> List[str]:
-    """
-    1) Reglas semánticas (viajes, conflictos PAN, cambios gabinete) por COLUMNA.
-    2) Si no hay match, fallback n-grams filtrados (sin actores/roles/basura).
-    Devuelve: "Título (menciones: N) — medios: A, B"
-    """
     from collections import defaultdict, Counter
 
-    # Agrupa por columna
-    cols = {}  # col_id -> {medio, txt, txt_up}
+    # ---- Agrupa por columna y limpia URL/medio del texto ----
+    cols = {}
     for it in items:
         cid = it["col_id"]
         medio = it.get("medio","SIN MEDIO")
         cuerpo = (it.get("cuerpo") or "")
-        cab = " ".join(it.get("actors", [])) + " " + it.get("alcance","")
-        txt = limpiar(cab + " " + cuerpo)
+        cuerpo_sin_urls = URL_RE.sub(" ", cuerpo)
+        cabecera = " ".join(it.get("actors", [])) + " " + it.get("alcance","")
+        txt = limpiar(cabecera + " " + cuerpo_sin_urls)
+
+        # quita explícitamente el nombre del medio del texto para que no sesgue
+        medio_pat = re.escape(medio)
+        txt = re.sub(medio_pat, " ", txt, flags=re.IGNORECASE)
+
         cols[cid] = {"medio": medio, "txt": txt, "txt_up": _up(txt)}
 
-    # Intento semántico
+    # ---- Reglas semánticas por columna ----
     tema_cols = defaultdict(set)
     tema_medios = defaultdict(set)
     for cid, data in cols.items():
-        txt_up = data["txt_up"]
-        medio = data["medio"]
+        txt_up = data["txt_up"]; medio = data["medio"]
         for regla in TOPIC_RULES:
-            if _texto_cumple_regla(txt_up, regla):
-                label = regla["label"]
-                tema_cols[label].add(cid)
-                tema_medios[label].add(medio)
+            def match(grupo):
+                return any(w in txt_up for w in grupo)
+            if all(any(w in txt_up for w in conj) for conj in regla.get("must_any", [])) \
+               and all(match(gr) for gr in regla.get("any", [])) \
+               and not any(match(gr) for gr in regla.get("avoid", [])):
+                tema_cols[regla["label"]].add(cid)
+                tema_medios[regla["label"]].add(medio)
 
     if tema_cols:
         orden = sorted(tema_cols.items(), key=lambda kv: len(kv[1]), reverse=True)[:max_temas]
@@ -385,7 +348,7 @@ def extraer_temas(items: List[Dict], max_temas: int = 5) -> List[str]:
             salida.append(f"{label} (menciones: {menc}) — medios: {meds}")
         return salida
 
-    # Fallback: n-grams sin actores
+    # ---- Fallback n-grams sin actores/roles/urls/medios ----
     cnt = Counter()
     tema_en_medio = defaultdict(set)
     actores_can_sin_acento = { _sin_acentos(a) for a in ACTORES_CANON_SET }
@@ -501,30 +464,23 @@ async def recibir_columnas(message: Message):
     try:
         if SOURCE_CHAT_ID and str(message.chat.id) != str(SOURCE_CHAT_ID):
             return
-
         texto = message.text or ""
         if "/" not in texto:
             return
-
         items = parse_message(texto)
         if not items:
             return
-
         existentes = {it["col_id"] for it in all_items}
         nuevos = [it for it in items if it["col_id"] not in existentes]
         if not nuevos:
             return
-
         all_items.extend(nuevos)
-
-        # Alertas (🔴/⚠️)
         for it in nuevos:
             if it["color"] in ("🔴", "⚠️") and ALERTS_CHAT_ID:
                 try:
                     await bot.send_message(ALERTS_CHAT_ID, armar_alerta(it), disable_web_page_preview=True)
                 except Exception as e:
                     logging.error(f"Error enviando alerta: {e}")
-
     except Exception as e:
         logging.error(f"Error en recibir_columnas: {e}")
 
