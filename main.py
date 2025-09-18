@@ -1,3 +1,6 @@
+await bot.send_message(SUMMARY_CHAT_ID, generar_resumen(subset, titulo), disable_web_page_preview=True)
+await bot.send_message(SUMMARY_CHAT_ID, generar_resumen(subset, titulo), disable_web_page_preview=True)
+await bot.send_message(ALERTS_CHAT_ID, armar_alerta(it), disable_web_page_preview=True)
 import os
 import logging
 import asyncio
