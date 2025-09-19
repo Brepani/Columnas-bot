@@ -1,335 +1,289 @@
 # main.py
-# aiogram v3.x
-
 import os
 import re
 import asyncio
 import logging
-import unicodedata
-from collections import Counter, defaultdict
-from datetime import datetime, time, timedelta
-
+from datetime import datetime, time
+from typing import Dict, List, Optional
 import pytz
-from aiogram import Bot, Dispatcher, Router
-from aiogram.filters import Command, CommandStart
+
+from aiogram import Bot, Dispatcher
 from aiogram.types import Message
+from aiogram.filters import Command
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 # =========================
 # Config desde variables de entorno
 # =========================
-TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
-if not TOKEN:
-    raise RuntimeError("Falta TELEGRAM_TOKEN")
+TOKEN = os.getenv("TELEGRAM_TOKEN")
+SOURCE_CHAT_ID = int(os.getenv("SOURCE_CHAT_ID", "0"))
+SUMMARY_CHAT_ID = int(os.getenv("SUMMARY_CHAT_ID", "0"))
+ALERTS_CHAT_ID = int(os.getenv("ALERTS_CHAT_ID", "0"))
+TZ = os.getenv("TIMEZONE", "America/Chihuahua")
+RANGO_INICIO = os.getenv("RANGO_INICIO", "06:00")
+RANGO_FIN = os.getenv("RANGO_FIN", "08:00")
+RESUMEN_HORA = os.getenv("RESUMEN_HORA", "08:30")
 
-# Chat origen (donde llegan las columnas)
-SOURCE_CHAT_ID = int(os.getenv("SOURCE_CHAT_ID", "0") or "0")
-# Chat de resumen
-SUMMARY_CHAT_ID = int(os.getenv("SUMMARY_CHAT_ID", "0") or "0")
-# Chat para alertas/negativas
-ALERTS_CHAT_ID = int(os.getenv("ALERTS_CHAT_ID", "0") or "0")
+bot = Bot(token=TOKEN)
+dp = Dispatcher()
+mx_tz = pytz.timezone(TZ)
 
-# Zona horaria
-TZ_NAME = os.getenv("TIMEZONE", "America/Chihuahua")
-TZ = pytz.timezone(TZ_NAME)
-
-# Ventana AM por defecto (06:00–08:00) y hora auto-resumen (08:30)
-AM_START = time(6, 0)
-AM_END = time(8, 0)
-AUTO_SUMMARY_HOUR = 8
-AUTO_SUMMARY_MIN = 30
+ENTRADAS: List[Dict] = []
 
 # =========================
-# Estado en memoria
+# Catálogos y normalización
 # =========================
-# Guardamos entradas de columnas: [{"dt": datetime, "color": "green|yellow|red|alert",
-# "actors": [..], "medio": str, "url": str, "raw": str}]
-ENTRADAS = []
-# Para evitar duplicados por URL
-VISTAS_URL = set()
+EMOJI_SENT = {"🟢": "pos", "🟡": "neu", "🔴": "neg", "⚠️": "alert"}
+EMOJI_ORDER = ["🟢", "🟡", "🔴", "⚠️"]
 
-# =========================
-# Utilidades
-# =========================
-COLOR_MAP = {
-    "🟢": "green", "🟡": "yellow", "🔴": "red", "⚠️": "alert",
-    "🟠": "alert", "🟥": "red", "🟨": "yellow", "🟩": "green"
+MEDIOS_CONOCIDOS = {
+    "ENTRELÍNEAS", "ENTRELINEAS", "OMNIA", "VOZ EN RED", "LA PARADOJA",
+    "EL DIARIO DE CHIHUAHUA", "EL HERALDO DE CHIHUAHUA", "NET NOTICIAS",
+    "EL BORDO", "LA JIRIBILLA", "OJOS DE HIERRO", "TIEMPO"
+}
+
+DOMAIN_TO_MEDIO = {
+    "omnia.com.mx": "OMNIA",
+    "entrelineas.com.mx": "ENTRELÍNEAS",
+    "vozenred.com.mx": "VOZ EN RED",
+    "eldiariodechihuahua.mx": "EL DIARIO DE CHIHUAHUA",
+    "elheraldodechihuahua.com.mx": "EL HERALDO DE CHIHUAHUA",
+    "netnoticias.mx": "NET NOTICIAS",
+    "elbordo.com.mx": "EL BORDO",
+    "lajiribilla.com.mx": "LA JIRIBILLA",
+    "tiempo.com.mx": "TIEMPO"
 }
 
 STOP_TOKENS = {
-    "OTROS DE INTERES", "OTROS DE INTERÉS",
-    "ESTATAL", "MUNICIPAL", "JUÁREZ", "JUAREZ",
-    "CHIHUAHUA", "LOCAL", "NACIONAL", "EL", "LA", "DEL", "DE", "LOCALE"
+    "OTROS DE INTERES","OTROS DE INTERÉS","OTROS","DE","INTERES","INTERÉS",
+    "LOCAL","ESTATAL","MUNICIPAL","ESTADO","CIUDAD","CHIHUAHUA","JUÁREZ","JUAREZ",
+    "ALCALDE","PRESIDENTE","GOBERNADOR","GOBERNADORA","GABINETE","SEGURIDAD",
+    "EDICIÓN","EDICION","COLUMNA","COLUMNAS","OPINIÓN","OPINION","SECCIÓN","SECCION",
+    "POLÍTICA","POLITICA","EDITORIAL","GPS"
 }
 
-# Alias de actores (normalizados sin acentos y en minúsculas)
-ACTOR_ALIASES = {
-    "marco bonilla": {
-        "bonilla", "alcalde bonilla", "marco bonilla", "marco bonilla mendoza",
-        "alcalde de chihuahua", "presidente municipal chihuahua", "alcalde marco bonilla"
-    },
-    "maru campos": {
-        "maru campos", "maria eugenia campos", "maría eugenia campos", "gobernadora campos",
-        "maru campos galvan", "maría eugenia campos galván", "gobernadora de chihuahua"
-    },
-    "cruz pérez cuéllar": {
-        "cruz pérez cuéllar", "cruz perez cuellar", "perez cuellar", "alcalde de juarez",
-        "alcalde de juárez", "cruz pérez"
-    },
-    "pan": {"pan", "accion nacional", "acción nacional", "albiazul"},
-    "morena": {"morena", "movimiento de regeneracion nacional", "movimiento de regeneración nacional", "guinda"},
-    "pri": {"pri", "partido revolucionario institucional", "tricolor"},
-}
-
-def norm_txt(s: str) -> str:
-    s = s or ""
-    s = unicodedata.normalize("NFD", s)
-    s = "".join(ch for ch in s if unicodedata.category(ch) != "Mn")
-    return s.lower().strip()
+def norm(s: str) -> str:
+    s = (s or "").upper().strip()
+    s = (s.replace("Á","A").replace("É","E").replace("Í","I")
+           .replace("Ó","O").replace("Ú","U").replace("Ü","U")
+           .replace("Ñ","N"))
+    s = re.sub(r"\s+", " ", s)
+    return s
 
 def ahora_tz() -> datetime:
-    return datetime.now(TZ)
+    return datetime.now(mx_tz)
 
-def en_ventana_am(dt: datetime) -> bool:
-    t = dt.timetz()
-    return AM_START <= t.replace(tzinfo=None) <= AM_END
-
-def extraer_url(text: str) -> str:
-    m = re.search(r"(https?://\S+)", text, flags=re.IGNORECASE)
-    return m.group(1) if m else ""
-
-def parse_header(header: str):
-    """
-    Devuelve: color(str), actores[list], medio(str)
-    Header típico: "🟡 BONILLA / PAN / ENTRELÍNEAS"
-    """
-    color = "yellow"
-    for c in COLOR_MAP:
-        if c in header:
-            color = COLOR_MAP[c]
-            header = header.replace(c, " ")
-            break
-
-    # Partes separadas por "/"
-    partes = [p.strip() for p in header.split("/") if p.strip()]
-    if not partes:
-        return color, [], "SIN MEDIO"
-
-    # Última parte la tomamos como medio
-    medio = partes[-1].upper()
-
-    # Resto: actores brutos (limpiamos tokens comunes)
-    actores_brutos = []
-    for tok in partes[:-1]:
-        tokU = tok.upper()
-        if tokU in STOP_TOKENS:
+# =========================
+# Helpers de encabezado
+# =========================
+def extraer_encabezado(lineas: List[str]) -> Optional[str]:
+    for ln in lineas[:5]:
+        t = ln.strip()
+        if not t:
             continue
-        actores_brutos.append(tok)
+        if any(t.startswith(e) for e in EMOJI_ORDER) and t.count("/") >= 2:
+            return t
+    return None
 
-    # Normalización por alias
-    actores_canon = []
-    for ab in actores_brutos:
-        nab = norm_txt(ab)
-        canon = None
-        for can_name, alias_set in ACTOR_ALIASES.items():
-            if nab in alias_set or nab == norm_txt(can_name):
-                canon = can_name
-                break
-        if canon is None:
-            # Si no matchea alias, usamos el texto capitalizado sin acentos
-            canon = ab.title()
-        if canon not in actores_canon:
-            actores_canon.append(canon)
+def detectar_sentimiento(enc: str) -> str:
+    for e in EMOJI_ORDER:
+        if e in enc:
+            return EMOJI_SENT[e]
+    return "neu"
 
-    return color, actores_canon, medio
+def split_slashes(enc: str) -> List[str]:
+    return [p.strip() for p in enc.split("/") if p.strip()]
 
-def registrar_entrada(texto: str):
-    # Buscamos encabezado en la primera línea con slashes o color
-    lines = [l.strip() for l in texto.splitlines() if l.strip()]
-    header = lines[0] if lines else ""
-    color, actores, medio = parse_header(header)
+def _medio_por_dominio(texto: str) -> Optional[str]:
+    urls = re.findall(r"https?://([^/\s]+)/?", texto, flags=re.IGNORECASE)
+    if not urls:
+        return None
+    host = urls[-1].lower()
+    host = re.sub(r"^www\.", "", host)
+    for dom, medio in DOMAIN_TO_MEDIO.items():
+        if host.endswith(dom):
+            return medio
+    return None
 
-    url = extraer_url(texto)
-    if url and url in VISTAS_URL:
-        return
-    if url:
-        VISTAS_URL.add(url)
+def decidir_medio(parts: List[str], texto_completo: str) -> str:
+    if parts:
+        candidato = norm(parts[-1])
+        candidato = re.sub(r"[^\w\s-]", "", candidato)
+        if candidato in {norm(m) for m in MEDIOS_CONOCIDOS}:
+            for m in MEDIOS_CONOCIDOS:
+                if norm(m) == candidato:
+                    return m
+    medio_link = _medio_por_dominio(texto_completo)
+    if medio_link:
+        return medio_link
+    return "SIN MEDIO"
 
-    ENTRADAS.append({
-        "dt": ahora_tz(),
-        "color": color,
-        "actors": actores,
+def decidir_actores(parts: List[str]) -> List[str]:
+    actores_raw = parts[:-1] if len(parts) >= 2 else parts
+    actores: List[str] = []
+    for a in actores_raw:
+        a_n = norm(re.sub(r"[^\w\s-]", "", a))
+        if not a_n or a_n in STOP_TOKENS or len(a_n) <= 2:
+            continue
+        actores.append(a_n)
+    vistos, res = set(), []
+    for a in actores:
+        if a not in vistos:
+            vistos.add(a)
+            res.append(a)
+    return res
+
+def extraer_link(texto: str) -> Optional[str]:
+    m = re.findall(r"https?://\S+", texto)
+    return m[-1] if m else None
+
+# =========================
+# Parseo de mensaje
+# =========================
+def parsear_columna(msg: Message) -> Optional[Dict]:
+    if not (msg.text or msg.caption):
+        return None
+    full = msg.text or msg.caption or ""
+    lineas = full.splitlines()
+    enc = extraer_encabezado(lineas)
+    if not enc:
+        return None
+
+    sent = detectar_sentimiento(enc)
+    parts = split_slashes(enc)
+    medio = decidir_medio(parts, full)
+    actores = decidir_actores(parts)
+
+    return {
+        "fecha": datetime.fromtimestamp(msg.date, tz=mx_tz),
+        "sent": sent,
         "medio": medio,
-        "url": url,
-        "raw": texto
-    })
-
-def build_resumen(subset, titulo_prefix="COLUMNAS"):
-    # Conteos de semáforo
-    c = Counter(e["color"] for e in subset)
-    total = len(subset)
-
-    # Actores
-    actor_tot = Counter()
-    actor_sem = defaultdict(lambda: Counter())
-    for e in subset:
-        for a in e["actors"]:
-            actor_tot[a] += 1
-            actor_sem[a][e["color"]] += 1
-
-    # Medios
-    medios = sorted({e["medio"] for e in subset if e["medio"]})
-
-    # Armado texto
-    now = ahora_tz()
-    header = f"🔵 {titulo_prefix} / {now.strftime('%a %d %b %Y – %H:%M')}\n\n"
-    semaforo = (
-        "🪫 Semáforo\n"
-        f"🟢 Positivas: {c.get('green',0)}\n"
-        f"🟡 Neutras:   {c.get('yellow',0)}\n"
-        f"🔴 Negativas: {c.get('red',0)}\n"
-        f"⚠️ Alertas:   {c.get('alert',0)}\n"
-        f"Total entradas: {total}\n"
-    )
-
-    actores_txt = "👥 Actores top\n-------------------------\n"
-    if actor_tot:
-        # top 10
-        for a, n in actor_tot.most_common(10):
-            row = f"{a.upper()}\n| Total {n}   "
-            row += f"🟢{actor_sem[a].get('green',0)} "
-            row += f"🟡{actor_sem[a].get('yellow',0)} "
-            row += f"🔴{actor_sem[a].get('red',0)} "
-            row += f"⚠️{actor_sem[a].get('alert',0)}\n"
-            actores_txt += row
-    else:
-        actores_txt += "(sin actores detectados)\n"
-
-    medios_txt = "📰 Medios con publicación\n"
-    if medios:
-        for m in medios:
-            medios_txt += f"- {m}\n"
-    else:
-        medios_txt += "- (sin medios)\n"
-
-    return header + semaforo + "\n" + actores_txt + "\n" + medios_txt
+        "actores": actores,
+        "link": extraer_link(full) or "",
+        "raw_header": enc
+    }
 
 # =========================
-# Bot y handlers
+# Handlers
 # =========================
-router = Router()
-
-@router.message(CommandStart())
-async def cmd_start(m: Message):
-    await m.answer("Hola 👋 Listo para resumir columnas. Usa /resumen_hoy o /resumen_am.")
-
-@router.message(Command("resumen_hoy"))
-async def cmd_resumen_hoy(m: Message):
-    # Filtra por HOY (si no hay en la ventana, usa todo HOY)
-    today = ahora_tz().date()
-    hoy = [e for e in ENTRADAS if e["dt"].date() == today]
-    if not hoy:
-        await m.answer("No tengo columnas registradas para hoy.")
-        return
-
-    subset = hoy  # sin ventana
-    txt = build_resumen(subset, "COLUMNAS")
-    await m.answer(txt)
-
-@router.message(Command("resumen_am"))
-async def cmd_resumen_am(m: Message):
-    today = ahora_tz().date()
-    hoy = [e for e in ENTRADAS if e["dt"].date() == today]
-    subset = []
-    for e in hoy:
-        t = e["dt"].astimezone(TZ).timetz().replace(tzinfo=None)
-        if AM_START <= t <= AM_END:
-            subset.append(e)
-
-    titulo = "COLUMNAS AM"
-    if not subset:
-        await m.answer(f"🔵 {titulo} / Hoy no se recibieron columnas entre {AM_START.strftime('%H:%M')}–{AM_END.strftime('%H:%M')}.")
-        return
-
-    txt = build_resumen(subset, titulo)
-    await m.answer(txt)
-
-@router.message()
+@dp.message()
 async def on_message(m: Message):
-    # Solo guardamos lo que venga del chat origen
     if SOURCE_CHAT_ID and m.chat.id != SOURCE_CHAT_ID:
         return
-
-    if not (m.text or m.caption):
+    col = parsear_columna(m)
+    if not col:
         return
+    ENTRADAS.append(col)
 
-    contenido = (m.text or m.caption or "").strip()
-    # Debe tener formato de cabecera para considerarse columna
-    if "/" not in contenido and not any(c in contenido for c in COLOR_MAP.keys()):
-        return
+    if ALERTS_CHAT_ID and col["sent"] in ("neg", "alert"):
+        resumen = armar_alerta(col)
+        await bot.send_message(ALERTS_CHAT_ID, resumen, disable_web_page_preview=True)
 
-    registrar_entrada(contenido)
-
-    # Si es negativa/alerta, avisa al grupo de alertas
-    try:
-        color, _, _ = parse_header(contenido.splitlines()[0])
-        if color in ("red", "alert") and ALERTS_CHAT_ID:
-            snippet = contenido.splitlines()[0][:200]
-            await m.bot.send_message(
-                ALERTS_CHAT_ID,
-                f"🚨 Nueva {'NEGATIVA' if color=='red' else 'ALERTA'} detectada:\n{snippet}"
-            )
-    except Exception:
-        pass
+def armar_alerta(col: Dict) -> str:
+    icono = {"pos":"🟢","neu":"🟡","neg":"🔴","alert":"⚠️"}[col["sent"]]
+    act = ", ".join(col["actores"]) if col["actores"] else "SIN ACTOR"
+    medio = col["medio"]
+    link = col["link"]
+    partes = [
+        f"{icono} ALERTA",
+        f"Actores: {act}",
+        f"Medio: {medio}"
+    ]
+    if link:
+        partes.append(f"Link: {link}")
+    return "\n".join(partes)
 
 # =========================
-# Programación automática 08:30
+# Resumen
 # =========================
-async def enviar_resumen_autom(bot: Bot):
-    today = ahora_tz().date()
-    hoy = [e for e in ENTRADAS if e["dt"].date() == today]
-    subset = []
-    for e in hoy:
-        t = e["dt"].astimezone(TZ).timetz().replace(tzinfo=None)
-        if AM_START <= t <= AM_END:
-            subset.append(e)
+def build_resumen(entradas: List[Dict], titulo: str) -> str:
+    c_pos = sum(1 for e in entradas if e["sent"] == "pos")
+    c_neu = sum(1 for e in entradas if e["sent"] == "neu")
+    c_neg = sum(1 for e in entradas if e["sent"] == "neg")
+    c_ale = sum(1 for e in entradas if e["sent"] == "alert")
 
-    titulo = "COLUMNAS AM"
+    actores_map: Dict[str, Dict[str,int]] = {}
+    for e in entradas:
+        for a in e["actores"]:
+            actores_map.setdefault(a, {"pos":0,"neu":0,"neg":0,"alert":0,"tot":0})
+            actores_map[a][e["sent"]] += 1
+            actores_map[a]["tot"] += 1
+
+    actores_top = sorted(actores_map.items(), key=lambda x: (-x[1]["tot"], x[0]))[:10]
+    medios = sorted({e["medio"] for e in entradas})
+
+    ahora = ahora_tz()
+    head = [
+        f"🔵 {titulo} / {ahora.strftime('%a %d %b %Y – %H:%M')}",
+        "",
+        "🪫 Semáforo",
+        f"🟢 Positivas: {c_pos}",
+        f"🟡 Neutras:   {c_neu}",
+        f"🔴 Negativas: {c_neg}",
+        f"⚠️ Alertas:   {c_ale}",
+        f"Total entradas: {len(entradas)}",
+        ""
+    ]
+
+    actores_lines = ["👥 Actores top", "-------------------------"]
+    if actores_top:
+        for nombre, cnt in actores_top:
+            linea = f"{nombre}\n| Total {cnt['tot']}   🟢{cnt['pos']} 🟡{cnt['neu']} 🔴{cnt['neg']} ⚠️{cnt['alert']}"
+            actores_lines.append(linea)
+    else:
+        actores_lines.append("— sin actores detectados —")
+
+    medios_lines = ["", "📰 Medios con publicación"]
+    if medios:
+        for m in medios:
+            medios_lines.append(f"- {m}")
+    else:
+        medios_lines.append("— sin medios —")
+
+    cuerpo = "\n".join(head + actores_lines + medios_lines)
+    return cuerpo
+
+async def enviar_resumen(subset: List[Dict], titulo: str):
     if not subset:
-        await bot.send_message(
-            SUMMARY_CHAT_ID,
-            f"🔵 {titulo} / Hoy no se recibieron columnas entre {AM_START.strftime('%H:%M')}–{AM_END.strftime('%H:%M')}."
-        )
+        msg = "🔵 COLUMNAS AM / Hoy no se recibieron columnas en el periodo solicitado."
+        await bot.send_message(SUMMARY_CHAT_ID, msg, disable_web_page_preview=True)
         return
+    texto = build_resumen(subset, "COLUMNAS")
+    await bot.send_message(SUMMARY_CHAT_ID, texto, disable_web_page_preview=True)
 
-    await bot.send_message(SUMMARY_CHAT_ID, build_resumen(subset, titulo))
+@dp.message(Command("resumen_hoy"))
+async def cmd_resumen_hoy(m: Message):
+    now = ahora_tz()
+    hoy = now.date()
+    h1 = datetime.combine(hoy, time.fromisoformat(RANGO_INICIO)).astimezone(mx_tz)
+    h2 = datetime.combine(hoy, time.fromisoformat(RANGO_FIN)).astimezone(mx_tz)
 
-def programar_cron(scheduler: AsyncIOScheduler, bot: Bot):
-    # Ejecuta todos los días a la hora local indicada
-    scheduler.add_job(
-        enviar_resumen_autom,
-        "cron",
-        hour=AUTO_SUMMARY_HOUR,
-        minute=AUTO_SUMMARY_MIN,
-        args=[bot],
-        timezone=TZ_NAME,
-        id="enviar_resumen_autom",
-        replace_existing=True
-    )
+    subset = [e for e in ENTRADAS if h1 <= e["fecha"] <= h2]
+    await enviar_resumen(subset, "COLUMNAS")
 
 # =========================
-# Arranque
+# Scheduler 8:30 AM
+# =========================
+def programar_scheduler():
+    scheduler = AsyncIOScheduler(timezone=mx_tz)
+    hh, mm = RESUMEN_HORA.split(":")
+    scheduler.add_job(job_resumen_automatico, "cron", hour=int(hh), minute=int(mm))
+    scheduler.start()
+
+async def job_resumen_automatico():
+    now = ahora_tz()
+    hoy = now.date()
+    h1 = datetime.combine(hoy, time.fromisoformat(RANGO_INICIO)).astimezone(mx_tz)
+    h2 = datetime.combine(hoy, time.fromisoformat(RANGO_FIN)).astimezone(mx_tz)
+    subset = [e for e in ENTRADAS if h1 <= e["fecha"] <= h2]
+    await enviar_resumen(subset, "COLUMNAS")
+
+# =========================
+# Main
 # =========================
 async def main():
     logging.basicConfig(level=logging.INFO)
-    bot = Bot(token=TOKEN, parse_mode="HTML")
-    dp = Dispatcher()
-    dp.include_router(router)  # <<< IMPORTANTE: incluir router para que escuche
-
-    scheduler = AsyncIOScheduler(timezone=TZ)
-    scheduler.start()
-    programar_cron(scheduler, bot)
-
+    programar_scheduler()
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
